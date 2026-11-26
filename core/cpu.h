@@ -7,8 +7,7 @@
 struct HvMachine;
 
 enum HvHaltReason {
-    HV_HALT_NONE, HV_HALT_SHUTDOWN, HV_HALT_RESET, HV_HALT_HOST, HV_HALT_PANIC,
-    HV_HALT_SAVE /* stopped to be saved (instant resume): it can run on, or be saved and resumed later */
+    HV_HALT_NONE, HV_HALT_SHUTDOWN, HV_HALT_RESET, HV_HALT_HOST, HV_HALT_PANIC
 };
 
 /* One software TLB entry. host = guest VA + addend. The exec tag is the guest
