@@ -22,23 +22,7 @@ double henge_install_progress(void);
 /* Writes a blank auxiliary storage file (what VZMacAuxiliaryStorage makes). 0 or -1. */
 int henge_make_aux(const char *path);
 
-/* Instant resume (../host/snapshot.h). henge_vm_suspend stops a running Mac where it is and writes it to path; it
-   stays paused (state 4) until henge_vm_continue runs it on, or henge_vm_stop ends it. 0 if saved; -1 with a
-   reason if not (the Mac then still runs, unless it stopped by itself meanwhile). henge_vm_resume is henge_vm_boot
-   from a saved Mac: the same settings, and the disk exactly as it was saved, or it fails and nothing runs. ident is
-   what the file is valid for (the app's build, the Mac, its disk). henge_vm_saved_ok: 0 if path is a whole saved
-   Mac for ident, and its size and save time. */
-int henge_vm_suspend(const char *path, const char *ident, char *err, size_t errlen);
-/* The two halves of henge_vm_suspend. Pausing needs the GPU (what only it holds goes back into the Mac's memory), which
-   iOS refuses an app in the background: pause when Henge stops being active, save once it is in the background. */
-int henge_vm_pause(char *err, size_t errlen);
-int henge_vm_save(const char *path, const char *ident, char *err, size_t errlen);
-int henge_vm_continue(void);
-int henge_vm_resume(const char *rom, const char *disk, const char *aux, uint64_t ecid, uint64_t seed, uint64_t ram_mb,
-                    int cpus, const char *path, const char *ident, char *err, size_t errlen);
-int henge_vm_saved_ok(const char *path, const char *ident, uint64_t *bytes, int64_t *saved_at);
-
-/* 0 not started, 1 running, 2 stopped, 3 starting/stopping, 4 paused (saved, or being saved).
+/* 0 not started, 1 running, 2 stopped, 3 starting/stopping.
    Normal guests are fully released before state 2; installer sessions retain
    their restore stack and can_start stays false. */
 int henge_vm_state(void);
@@ -78,11 +62,6 @@ long henge_share_agent_seen(void);
 
 /* The size macOS is told its screen is. Before henge_vm_boot. */
 void henge_vm_set_display(uint32_t width, uint32_t height);
-/* What the guest's About This Mac says, for the next boot (NULL leaves the vmapple
-   identity): the chip's name, the product name, and — experimental — the model
-   identifier (hw.model). The chip goes through the config region; the other two
-   are fixed up in the guest's device tree while iBoot runs (host/dt_fixup.c). */
-void henge_vm_set_identity(const char *soc_name, const char *product_name, const char *model_id);
 /* The panel's physical size; 0, 0 for the default (a ~122 ppi, 1x screen). Before boot. */
 void henge_vm_set_display_mm(uint32_t width_mm, uint32_t height_mm);
 void henge_vm_key(uint16_t code, int down);
