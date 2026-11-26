@@ -16,6 +16,9 @@ name: Build Henge IPA
 # Manual only (Actions tab > Build Henge IPA > Run workflow): pushes to main don't build an IPA.
 on:
   workflow_dispatch: {}
+  # This fork's scroll branch: a push builds the IPA too (no gh/API token is needed to start it).
+  push:
+    branches: [smooth-scroll-0.3]
 
 env:
   HUSK: ${{ github.workspace }}/Husk
