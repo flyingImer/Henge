@@ -269,7 +269,9 @@ final class HardwareMouse {
         }
         guard first.isFinite, second.isFinite else { return }
         if first == 0 && second == 0 {
-            scrollFingers.end()
+            // Not the end of the gesture: on a Magic Keyboard the axes also fall back to zero between the
+            // samples of a swipe that goes on. ScrollFingers lifts once the input stays quiet.
+            scrollFingers.stopSoon()
             return
         }
         let defaults = UserDefaults.standard
@@ -307,11 +309,15 @@ final class HardwareMouse {
 /// stay clear of the touchscreen's 1...5. The two calls GameController makes per sample are merged into one frame,
 /// so the guest sees evenly spaced samples and works out the fingers' speed (and the momentum after) correctly.
 ///
-/// The emulated pad is only so big, and a long swipe runs off it. Lifting the fingers there at speed would start
-/// macOS's momentum, and putting them down again at once reads as a second flick during it, which macOS answers by
-/// scrolling faster and faster. So the fingers start at the edge they move away from, and at the far edge they
-/// first hold still for a moment (the motion meanwhile is kept), lift with no speed left, start again from the
-/// other edge, and the kept motion is paid out over the next samples.
+/// - A zero sample doesn't lift the fingers (GameController sends zeros between the samples of one swipe too):
+///   they lift once the input has been quiet for `idleLift`, stamped with the time of the first zero, so macOS
+///   still sees the speed they had and carries the scroll on.
+/// - The fingers go down a frame before they first move, so the first motion has a real time step: one stamped
+///   1 ms after the touch-down reads as a huge flick, or as noise macOS drops.
+/// - The emulated pad is only so big. At its far edge the fingers hold still for `edgeRest` (motion meanwhile is
+///   dropped), lift with no speed left, and go down again at the other edge. Paying the dropped motion out later
+///   would be a burst of speed, which macOS accelerates, so long swipes stopped scrolling in proportion.
+/// - One frame may not move faster than `maxSpeed`, for the same reason: a late, batched sample is not a flick.
 final class ScrollFingers {
     static let unitsPerPoint: Float = 40
     /// Two pairs, used in turn: a pair lifted at an edge isn't put down again under the same ids a moment later.
@@ -320,29 +326,41 @@ final class ScrollFingers {
     private var ids: (Int32, Int32) { Self.pairs[pair] }
     private var eventsLogged = 0
     private static let sensorW: Float = 8134, sensorH: Float = 5206
-    /// Where the fingers may go: clear of the pad's edges, and well clear of the bottom, where a real
+    /// Where the fingers may go: clear of the pad's edges, and clear of the bottom, where a real
     /// Magic Trackpad expects a resting thumb and macOS treats touches differently.
-    private static let minX: Float = sensorW * 0.12, maxX: Float = sensorW * 0.88
-    private static let minY: Float = sensorH * 0.15, maxY: Float = sensorH * 0.70
+    private static let minX: Float = sensorW * 0.10, maxX: Float = sensorW * 0.90
+    private static let minY: Float = sensorH * 0.08, maxY: Float = sensorH * 0.75
     private static let spread: Float = 1100 // the fingers' distance apart, about two centimetres
-    /// No sample for this long: the fingers lifted without the closing (0, 0).
-    private static let idleLift: TimeInterval = 0.12
+    /// No motion for this long: the swipe is over.
+    private static let idleLift: TimeInterval = 0.10
     private static let mergeDelay: TimeInterval = 0.003
     /// How long the fingers rest at an edge before lifting, so macOS sees them stopped.
-    private static let rest: TimeInterval = 0.05
+    private static let edgeRest: TimeInterval = 0.024
+    /// Sensor units a second (the pad is 8134 wide).
+    private static let maxSpeed: Float = 30000
 
     private var down = false
     private var x: Float = 0, y: Float = 0
     private var pendingX: Float = 0, pendingY: Float = 0
     private var flushScheduled = false
     private var idle: DispatchWorkItem?
-    /// Resting at an edge until this time; motion meanwhile goes to the backlog.
-    private var restingUntil: CFTimeInterval?
-    private var backlogX: Float = 0, backlogY: Float = 0
+    /// The first zero sample after the last motion: the lift's timestamp.
+    private var stoppedAt: UInt32?
+    /// The last timestamp sent: the guest needs them strictly increasing.
+    private var lastTs: UInt32 = 0
+    /// Held still at an edge since then.
+    private var edgeSince: CFTimeInterval?
 
     private static func now() -> UInt32 { UInt32(truncatingIfNeeded: Int(CACurrentMediaTime() * 1000)) }
 
+    private func stamp() -> UInt32 {
+        let t = Self.now()
+        return t > lastTs ? t : lastTs &+ 1
+    }
+
     func move(dx: Float, dy: Float) {
+        guard dx.isFinite, dy.isFinite, dx != 0 || dy != 0 else { return }
+        stoppedAt = nil
         pendingX += dx
         pendingY += dy
         if !flushScheduled {
@@ -355,16 +373,19 @@ final class ScrollFingers {
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.idleLift, execute: work)
     }
 
+    /// Both axes at zero: the swipe may be over. Remember when, for the lift's timestamp.
+    func stopSoon() {
+        if down && stoppedAt == nil { stoppedAt = stamp() }
+    }
+
     /// The gesture is over: lift both fingers, and macOS carries the scroll on as it would on a Mac.
     func end() {
         idle?.cancel()
         idle = nil
-        // Whatever was held back at an edge is dropped: replaying it now would be a jump.
-        restingUntil = nil
-        backlogX = 0
-        backlogY = 0
         flush()
-        lift()
+        lift(at: stoppedAt)
+        stoppedAt = nil
+        edgeSince = nil
     }
 
     private func flush() {
@@ -372,56 +393,56 @@ final class ScrollFingers {
         var dx = pendingX, dy = pendingY
         pendingX = 0
         pendingY = 0
-        guard dx != 0 || dy != 0 || restingUntil != nil else { return }
-        let ts = Self.now()
-
-        if let until = restingUntil {
-            backlogX += dx
-            backlogY += dy
-            if CACurrentMediaTime() < until {
-                frame(ts) // still: the guest's idea of the fingers' speed falls to nothing
+        guard dx != 0 || dy != 0 else { return }
+        let ts = stamp()
+        if !down {
+            place(towardX: dx, towardY: dy, ts: ts)
+        } else {
+            let gap = Float(min(max(Int64(ts) - Int64(lastTs), 4), 16)) / 1000
+            let limit = Self.maxSpeed * gap
+            let most = max(abs(dx), abs(dy))
+            if most > limit {
+                dx *= limit / most
+                dy *= limit / most
+            }
+        }
+        // How much of this motion fits before an edge.
+        let fx: Float = dx == 0 ? 1 : ((dx > 0 ? Self.maxX - Self.spread / 2 : Self.minX + Self.spread / 2) - x) / dx
+        let fy: Float = dy == 0 ? 1 : ((dy > 0 ? Self.maxY : Self.minY) - y) / dy
+        let fraction = max(0, min(1, fx, fy))
+        if fraction < 0.001 {
+            let t = CACurrentMediaTime()
+            if let since = edgeSince, t - since >= Self.edgeRest {
+                lift(at: nil)
+                edgeSince = nil
+                // Down at the other edge; the next sample is the first to move, with a real time step.
+                place(towardX: dx, towardY: dy, ts: stamp())
                 return
             }
-            restingUntil = nil
-            lift()
-            place(towardX: backlogX, towardY: backlogY)
-            dx = 0
-            dy = 0
-        }
-        // Pay out what was held back, a share each sample, on top of the new motion.
-        if backlogX != 0 || backlogY != 0 {
-            let shareX = backlogX * 0.35, shareY = backlogY * 0.35
-            dx += shareX
-            dy += shareY
-            backlogX -= shareX
-            backlogY -= shareY
-            if abs(backlogX) < 1 && abs(backlogY) < 1 { backlogX = 0; backlogY = 0 }
-        }
-        guard dx != 0 || dy != 0 else { return }
-        if !down { place(towardX: dx, towardY: dy) }
-        let nx = x + dx, ny = y + dy
-        if nx - Self.spread / 2 < Self.minX || nx + Self.spread / 2 > Self.maxX || ny < Self.minY || ny > Self.maxY {
-            // The edge: rest here, keeping this sample's motion for after.
-            restingUntil = CACurrentMediaTime() + Self.rest
-            log("edge at \(Int(x)),\(Int(y)): resting")
-            backlogX += dx
-            backlogY += dy
-            frame(ts)
+            if edgeSince == nil {
+                edgeSince = t
+                log("edge at \(Int(x)),\(Int(y)): resting")
+            }
+            frame(ts) // still: the guest's idea of the fingers' speed falls to nothing
             return
         }
-        x = nx
-        y = ny
+        edgeSince = nil
+        x += fraction * dx
+        y += fraction * dy
         frame(ts)
     }
 
     private func frame(_ ts: UInt32) {
-        henge_vm_touch(ids.0, 1, Int32(x - Self.spread / 2), Int32(y), ts)
-        henge_vm_touch(ids.1, 1, Int32(x + Self.spread / 2), Int32(y), ts)
-        henge_vm_touch_frame(ts)
+        let t = ts > lastTs ? ts : lastTs &+ 1
+        lastTs = t
+        henge_vm_touch(ids.0, 1, Int32(x - Self.spread / 2), Int32(y), t)
+        henge_vm_touch(ids.1, 1, Int32(x + Self.spread / 2), Int32(y), t)
+        henge_vm_touch_frame(t)
     }
 
-    /// Fingers down at the edge the motion leads away from, so a swipe has the whole pad to travel.
-    private func place(towardX: Float, towardY: Float) {
+    /// Fingers down at the edge the motion leads away from, so a swipe has the whole pad to travel. The touch-down
+    /// is stamped a frame (8 ms) before `ts`, so the first move after it has a real time step.
+    private func place(towardX: Float, towardY: Float, ts: UInt32) {
         let lowX = Self.minX + Self.spread / 2, highX = Self.maxX - Self.spread / 2
         let lowY = Self.minY, highY = Self.maxY
         if abs(towardY) >= abs(towardX) {
@@ -431,18 +452,22 @@ final class ScrollFingers {
             x = towardX > 0 ? lowX : highX
             y = Self.sensorH / 2
         }
-        let ts = Self.now()
+        let early = ts > 8 ? ts - 8 : ts
+        let t = early > lastTs ? early : lastTs &+ 1
         log("down \(ids.0)/\(ids.1) at \(Int(x)),\(Int(y))")
-        henge_vm_touch(ids.0, 0, Int32(x - Self.spread / 2), Int32(y), ts)
-        henge_vm_touch(ids.1, 0, Int32(x + Self.spread / 2), Int32(y), ts)
+        henge_vm_touch(ids.0, 0, Int32(x - Self.spread / 2), Int32(y), t)
+        henge_vm_touch(ids.1, 0, Int32(x + Self.spread / 2), Int32(y), t)
+        lastTs = t &+ 1 // each touch-down queues a report, one ms apart
         down = true
     }
 
-    private func lift() {
+    private func lift(at stopped: UInt32?) {
         guard down else { return }
-        let ts = Self.now()
-        henge_vm_touch(ids.0, 2, 0, 0, ts)
-        henge_vm_touch(ids.1, 2, 0, 0, ts)
+        var t = stamp()
+        if let s = stopped, s > lastTs { t = s }
+        henge_vm_touch(ids.0, 2, 0, 0, t)
+        henge_vm_touch(ids.1, 2, 0, 0, t)
+        lastTs = t &+ 3 // each lift queues two reports, one ms apart
         log("up \(ids.0)/\(ids.1) at \(Int(x)),\(Int(y))")
         down = false
         pair = (pair + 1) % Self.pairs.count
