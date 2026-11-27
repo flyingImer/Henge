@@ -152,8 +152,17 @@ final class HardwareMouse {
     static let speedKey = "henge.mouse.speed"
     static let reverseKey = "henge.mouse.reverse"
     static let scrollSpeedKey = "henge.mouse.scrollSpeed"
-    /// true (the default): scroll as two fingers on the Mac's Magic Trackpad 2. false: 0.3's wheel steps.
-    static let twoFingerScrollKey = "henge.mouse.twoFingerScroll"
+    /// How a hardware trackpad's scroll reaches the Mac (`ScrollMode`'s raw value). Default: linear wheel.
+    static let scrollModeKey = "henge.mouse.scrollMode"
+
+    enum ScrollMode: Int {
+        /// Wheel units in proportion to the finger's travel: fractions carry over, nothing is curved or capped.
+        case linearWheel = 0
+        /// Two fingers on the Mac's emulated Magic Trackpad 2: macOS's own trackpad scrolling and momentum.
+        case twoFingers = 1
+        /// 0.3's wheel steps (a square-root curve, at least a few units for any motion).
+        case classicWheel = 2
+    }
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
@@ -165,6 +174,9 @@ final class HardwareMouse {
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
     private let scrollFingers = ScrollFingers()
+    /// Linear wheel: the part of a unit not sent yet, per axis, and when the last motion came.
+    private var wheelRestH: Float = 0, wheelRestV: Float = 0
+    private var wheelLast: CFTimeInterval = 0
 
     func start() {
         let defaults = UserDefaults.standard
@@ -279,9 +291,10 @@ final class HardwareMouse {
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
         // GameController's values are the content's way; fingers on the Mac's pad move the other way.
-        if defaults.object(forKey: Self.twoFingerScrollKey) != nil && !defaults.bool(forKey: Self.twoFingerScrollKey) {
+        let mode = ScrollMode(rawValue: defaults.integer(forKey: Self.scrollModeKey)) ?? .linearWheel
+        if mode != .twoFingers { scrollFingers.end() }
+        if mode == .classicWheel {
             // Wheel steps, as in 0.3. Both axes of one sample reach the guest as one report.
-            scrollFingers.end()
             let mostlyVertical = abs(first) > 2 * abs(second)
             let mostlyHorizontal = abs(second) > 2 * abs(first)
             let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
@@ -292,10 +305,36 @@ final class HardwareMouse {
             if horizontal != 0 || vertical != 0 { henge_vm_mouse_scroll(horizontal, vertical) }
             return
         }
+        if mode == .linearWheel {
+            linearWheel(vertical: verticalChanged ? -first : 0, horizontal: horizontalChanged ? second : 0, scale: scale)
+            return
+        }
         let way: Float = reverse ? 1 : -1
         // Sensor units per GameController unit: about 40 at the default speed (0.3).
         let gain = way * ScrollFingers.unitsPerPoint * scale / 0.3
         scrollFingers.move(dx: horizontalChanged ? second * gain : 0, dy: verticalChanged ? first * gain : 0)
+    }
+
+    /// Wheel units per GameController point at scroll speed 1 (0.15 at the default 0.3): a slow swipe sends a unit
+    /// every few samples, a fast one several a sample, always in proportion to the travel.
+    static let wheelUnitsPerPoint: Float = 0.5
+
+    private func linearWheel(vertical: Float, horizontal: Float, scale: Float) {
+        let now = CACurrentMediaTime()
+        // A new gesture (a pause, or the other way) starts from nothing: an old fraction would be a phantom step.
+        if now - wheelLast > 0.5 { wheelRestH = 0; wheelRestV = 0 }
+        wheelLast = now
+        let way: Float = reverse ? -1 : 1
+        let gain = way * Self.wheelUnitsPerPoint * scale
+        let v = vertical * gain, h = horizontal * gain
+        if v != 0 && (v > 0) != (wheelRestV > 0) && wheelRestV != 0 { wheelRestV = 0 }
+        if h != 0 && (h > 0) != (wheelRestH > 0) && wheelRestH != 0 { wheelRestH = 0 }
+        wheelRestV += v
+        wheelRestH += h
+        let unitsV = wheelRestV.rounded(.towardZero), unitsH = wheelRestH.rounded(.towardZero)
+        wheelRestV -= unitsV
+        wheelRestH -= unitsH
+        if unitsV != 0 || unitsH != 0 { henge_vm_mouse_scroll(Int32(unitsH), Int32(unitsV)) }
     }
 
     private static func wheelUnits(_ value: Float, scale: Float) -> Int32 {
@@ -317,7 +356,6 @@ final class HardwareMouse {
 /// - The emulated pad is only so big. At its far edge the fingers hold still for `edgeRest` (motion meanwhile is
 ///   dropped), lift with no speed left, and go down again at the other edge. Paying the dropped motion out later
 ///   would be a burst of speed, which macOS accelerates, so long swipes stopped scrolling in proportion.
-/// - One frame may not move faster than `maxSpeed`, for the same reason: a late, batched sample is not a flick.
 final class ScrollFingers {
     static let unitsPerPoint: Float = 40
     /// Two pairs, used in turn: a pair lifted at an edge isn't put down again under the same ids a moment later.
@@ -336,8 +374,6 @@ final class ScrollFingers {
     private static let mergeDelay: TimeInterval = 0.003
     /// How long the fingers rest at an edge before lifting, so macOS sees them stopped.
     private static let edgeRest: TimeInterval = 0.024
-    /// Sensor units a second (the pad is 8134 wide).
-    private static let maxSpeed: Float = 30000
 
     private var down = false
     private var x: Float = 0, y: Float = 0
@@ -390,22 +426,12 @@ final class ScrollFingers {
 
     private func flush() {
         flushScheduled = false
-        var dx = pendingX, dy = pendingY
+        let dx = pendingX, dy = pendingY
         pendingX = 0
         pendingY = 0
         guard dx != 0 || dy != 0 else { return }
         let ts = stamp()
-        if !down {
-            place(towardX: dx, towardY: dy, ts: ts)
-        } else {
-            let gap = Float(min(max(Int64(ts) - Int64(lastTs), 4), 16)) / 1000
-            let limit = Self.maxSpeed * gap
-            let most = max(abs(dx), abs(dy))
-            if most > limit {
-                dx *= limit / most
-                dy *= limit / most
-            }
-        }
+        if !down { place(towardX: dx, towardY: dy, ts: ts) }
         // How much of this motion fits before an edge.
         let fx: Float = dx == 0 ? 1 : ((dx > 0 ? Self.maxX - Self.spread / 2 : Self.minX + Self.spread / 2) - x) / dx
         let fy: Float = dy == 0 ? 1 : ((dy > 0 ? Self.maxY : Self.minY) - y) / dy

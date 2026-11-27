@@ -6,7 +6,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
-    @AppStorage(HardwareMouse.twoFingerScrollKey) private var twoFingerScroll = true
+    @AppStorage(HardwareMouse.scrollModeKey) private var scrollMode = HardwareMouse.ScrollMode.linearWheel.rawValue
     @AppStorage(VolumeClicks.inputModeKey) private var inputMode = VolumeClicks.InputMode.touchscreen
     @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
     @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
@@ -69,7 +69,11 @@ struct SettingsView: View {
                             Slider(value: $mouseSpeed, in: 0.5...3)
                         }
                         Toggle("Reverse scrolling", isOn: $reverseScrolling)
-                        Toggle("Smooth scrolling (two fingers on the Mac's trackpad)", isOn: $twoFingerScroll)
+                        Picker("Trackpad scrolling", selection: $scrollMode) {
+                            Text("Wheel, linear").tag(HardwareMouse.ScrollMode.linearWheel.rawValue)
+                            Text("Two fingers (Mac trackpad)").tag(HardwareMouse.ScrollMode.twoFingers.rawValue)
+                            Text("Wheel, classic (0.3)").tag(HardwareMouse.ScrollMode.classicWheel.rawValue)
+                        }
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Scroll speed")
                             Slider(value: $scrollSpeed, in: 0.1...1.5)
